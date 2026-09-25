@@ -1,19 +1,14 @@
 /*
- * pepstat v3 — PeppermintOS system HUD + process viewer
+ * pepstat v4 — PeppermintOS HUD (btop-style)
  *
- *   sudo apt install build-essential
- *   make
- *   ./pepstat                 dashboard once
- *   ./pepstat -w              live HUD (no flicker)
- *   ./pepstat -p              process table once
- *   ./pepstat --plain         one line for XFCE Generic Monitor
- *   ./pepstat --json
+ *   gcc -std=gnu11 -O2 -Wall -Wextra -o pepstat pepstat.c
+ *   ./pepstat -w
+ *   ./pepstat --plain
+ *   ./pepstat --ice | --mint | --dim
  *
- * Live keys
- *   1 dash   2 procs   c/m sort   / filter   j/k move
- *   t TERM   K KILL    r refresh  q quit
- *
- * No ncurses, no GTK, no root. /proc + /sys + libc only.
+ * Live
+ *   1 dash  2 procs  c/m/n sort  / find  j/k move
+ *   u parent  t TERM  K KILL  r refresh  q quit
  */
 #define _POSIX_C_SOURCE 200809L
 #define _DEFAULT_SOURCE
@@ -50,43 +45,79 @@
 #define WARN_BAT_PCT      20
 #define CRIT_BAT_PCT      10
 #define MAX_PROCS         512
-#define VIEW_PROCS        16
+#define MAX_CORES         64
+#define HIST              48
 #define PREV_SLOTS        512
 #define FILTER_MAX        40
 
 enum { PAGE_DASH = 0, PAGE_PROC = 1 };
-enum { SORT_CPU = 0, SORT_RSS = 1 };
+enum { SORT_CPU = 0, SORT_RSS = 1, SORT_NAME = 2 };
+enum { THEME_MINT = 0, THEME_ICE = 1, THEME_DIM = 2 };
 
-#define RGB_MINT    61, 204, 122
-#define RGB_MINT2  150, 237, 103
-#define RGB_LEAF    26, 160,  90
-#define RGB_ICE    109, 227, 248
-#define RGB_ICE2   142, 247, 255
-#define RGB_FOG    168, 190, 178
-#define RGB_SLATE  110, 130, 122
-#define RGB_AMBER  255, 196,  64
-#define RGB_ROSE   255,  79, 107
-#define RGB_WHITE  236, 250, 240
-#define RGB_SELBG   20,  70,  48
+typedef struct { int r, g, b; } Rgb;
+
+static Rgb C_ACC, C_ACC2, C_LEAF, C_ICE, C_FOG, C_SLATE, C_AMBER, C_ROSE, C_WHITE, C_SEL, C_BOX;
 
 static int use_color = 1;
 static int use_unicode = 1;
 static int page = PAGE_DASH;
 static int sort_mode = SORT_CPU;
+static int theme_id = THEME_MINT;
 static int live_mode = 0;
 
 static char filter[FILTER_MAX];
 static int filter_edit;
-static int sel;
-static int scroll;
-static int selected_pid;
-static int confirm_sig;
+static int sel, scroll, selected_pid, confirm_sig;
 static char status_msg[160];
 static int view_idx[MAX_PROCS];
 static int nview;
 
 static struct termios term_orig;
 static int term_raw;
+
+static void set_rgb(Rgb *c, int r, int g, int b) { c->r = r; c->g = g; c->b = b; }
+
+static void apply_theme(int id)
+{
+    theme_id = id;
+    if (id == THEME_ICE) {
+        set_rgb(&C_ACC, 109, 227, 248);
+        set_rgb(&C_ACC2, 180, 245, 255);
+        set_rgb(&C_LEAF, 40, 140, 170);
+        set_rgb(&C_ICE, 142, 247, 255);
+        set_rgb(&C_FOG, 170, 200, 210);
+        set_rgb(&C_SLATE, 90, 120, 135);
+        set_rgb(&C_AMBER, 255, 196, 64);
+        set_rgb(&C_ROSE, 255, 90, 130);
+        set_rgb(&C_WHITE, 236, 250, 255);
+        set_rgb(&C_SEL, 16, 50, 70);
+        set_rgb(&C_BOX, 50, 140, 170);
+    } else if (id == THEME_DIM) {
+        set_rgb(&C_ACC, 70, 130, 95);
+        set_rgb(&C_ACC2, 120, 160, 130);
+        set_rgb(&C_LEAF, 50, 90, 70);
+        set_rgb(&C_ICE, 100, 140, 125);
+        set_rgb(&C_FOG, 130, 145, 138);
+        set_rgb(&C_SLATE, 80, 95, 88);
+        set_rgb(&C_AMBER, 180, 150, 70);
+        set_rgb(&C_ROSE, 170, 80, 90);
+        set_rgb(&C_WHITE, 200, 210, 202);
+        set_rgb(&C_SEL, 24, 40, 32);
+        set_rgb(&C_BOX, 55, 85, 68);
+    } else {
+        set_rgb(&C_ACC, 61, 204, 122);
+        set_rgb(&C_ACC2, 150, 237, 103);
+        set_rgb(&C_LEAF, 26, 160, 90);
+        set_rgb(&C_ICE, 109, 227, 248);
+        set_rgb(&C_FOG, 168, 190, 178);
+        set_rgb(&C_SLATE, 110, 130, 122);
+        set_rgb(&C_AMBER, 255, 196, 64);
+        set_rgb(&C_ROSE, 255, 79, 107);
+        set_rgb(&C_WHITE, 236, 250, 240);
+        set_rgb(&C_SEL, 20, 70, 48);
+        set_rgb(&C_BOX, 26, 160, 90);
+    }
+}
 
 static int is_tty(void) { return isatty(STDOUT_FILENO); }
 
@@ -96,16 +127,16 @@ static void reset_col(void)
         fputs("\033[0m", stdout);
 }
 
-static void fg(int r, int g, int b)
+static void fg(Rgb c)
 {
     if (use_color)
-        printf("\033[38;2;%d;%d;%dm", r, g, b);
+        printf("\033[38;2;%d;%d;%dm", c.r, c.g, c.b);
 }
 
-static void bg(int r, int g, int b)
+static void bg(Rgb c)
 {
     if (use_color)
-        printf("\033[48;2;%d;%d;%dm", r, g, b);
+        printf("\033[48;2;%d;%d;%dm", c.r, c.g, c.b);
 }
 
 static void bold(void)
@@ -130,9 +161,9 @@ static int pct_level(double pct)
 
 static void fg_level(int lvl)
 {
-    if (lvl == 2) fg(RGB_ROSE);
-    else if (lvl == 1) fg(RGB_AMBER);
-    else fg(RGB_MINT);
+    if (lvl == 2) fg(C_ROSE);
+    else if (lvl == 1) fg(C_AMBER);
+    else fg(C_ACC);
 }
 
 static void copy_str(char *dst, size_t dstsz, const char *src)
@@ -144,7 +175,7 @@ static void copy_str(char *dst, size_t dstsz, const char *src)
         dst[0] = '\0';
         return;
     }
-    for (i = 0; i + 1 < dstsz && src[i] != '\0'; i++)
+    for (i = 0; i + 1 < dstsz && src[i]; i++)
         dst[i] = src[i];
     dst[i] = '\0';
 }
@@ -194,7 +225,6 @@ static int read_key_file(const char *path, const char *key, char *out, size_t n)
     FILE *f;
     char line[512];
     size_t klen;
-
     f = fopen(path, "r");
     if (!f)
         return -1;
@@ -235,8 +265,7 @@ static void human_bytes(double bytes, char *out, size_t n)
 
 static void human_secs(double secs, char *out, size_t n)
 {
-    unsigned long s = (unsigned long)secs;
-    unsigned long d, h, m;
+    unsigned long s = (unsigned long)secs, d, h, m;
     d = s / 86400UL; s %= 86400UL;
     h = s / 3600UL;  s %= 3600UL;
     m = s / 60UL;    s %= 60UL;
@@ -253,13 +282,12 @@ static void bar(double pct, int width)
     int i, lvl;
     const char *blocks[] = {" ", "▏", "▎", "▍", "▌", "▋", "▊", "▉", "█"};
 
-    if (width < 6)
-        width = 6;
+    if (width < 4)
+        width = 4;
     if (pct < 0) pct = 0;
     if (pct > 100) pct = 100;
     lvl = pct_level(pct);
     fg_level(lvl);
-
     if (!use_unicode) {
         int f = (int)((pct / 100.0) * width + 0.5);
         fputc('[', stdout);
@@ -269,8 +297,6 @@ static void bar(double pct, int width)
         reset_col();
         return;
     }
-
-    fputc('[', stdout);
     {
         double cells = (pct / 100.0) * width;
         int full = (int)cells;
@@ -282,52 +308,68 @@ static void bar(double pct, int width)
             else if (i == full && frac > 0)
                 fputs(blocks[frac], stdout);
             else {
-                fg(RGB_SLATE);
+                fg(C_SLATE);
                 fputs("░", stdout);
                 fg_level(lvl);
             }
         }
     }
-    fputc(']', stdout);
     reset_col();
 }
 
+static void spark(const double *h, int n, int width)
+{
+    static const char *ch[] = {"▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"};
+    int i, start;
+    if (width < 8)
+        width = 8;
+    if (n < 1) {
+        fg(C_SLATE);
+        for (i = 0; i < width; i++)
+            fputc(use_unicode ? '.' : '.', stdout);
+        reset_col();
+        return;
+    }
+    start = n > width ? n - width : 0;
+    for (i = start; i < n; i++) {
+        double p = h[i];
+        int idx;
+        if (p < 0) p = 0;
+        if (p > 100) p = 100;
+        idx = (int)(p / 100.0 * 7.0 + 0.5);
+        if (idx > 7) idx = 7;
+        fg_level(pct_level(p));
+        if (use_unicode)
+            fputs(ch[idx], stdout);
+        else
+            fputc(" .:-=+*#"[idx], stdout);
+    }
+    reset_col();
+}
+
+/* ---------- snapshots ---------- */
 typedef struct {
-    char hostname[128];
-    char pretty_os[128];
-    char kernel[160];
-    char cpu_model[160];
+    char hostname[128], pretty_os[128], kernel[160], cpu_model[160];
     int cpu_cores;
-    double load1, load5, load15;
-    double cpu_pct;
-    double uptime_sec;
-    unsigned long mem_total_kb, mem_avail_kb;
-    unsigned long swap_total_kb, swap_free_kb;
-    unsigned long disk_total, disk_free;
-    unsigned long home_total, home_free;
-    int have_home;
-    int have_bat, bat_pct;
-    char bat_status[32];
-    int have_temp;
+    double load1, load5, load15, cpu_pct, uptime_sec;
+    unsigned long mem_total_kb, mem_avail_kb, swap_total_kb, swap_free_kb;
+    unsigned long disk_total, disk_free, home_total, home_free;
+    int have_home, have_bat, bat_pct, have_temp, have_fan;
     double temp_c;
-    char iface[32];
-    char ipv4[64];
-    char init[32];
-    char session[32];
-    char display[32];
-    int nprocs;
-    int nthreads;
-    unsigned long long cpu_total;
-    unsigned long long cpu_idle;
+    int fan_rpm;
+    char fan_name[32];
+    char bat_status[32], iface[32], ipv4[64], init[32], session[32], display[32];
+    int nprocs, nthreads, ncores;
+    double core_pct[MAX_CORES];
+    unsigned long long cpu_total, cpu_idle;
+    unsigned long long core_total[MAX_CORES], core_idle[MAX_CORES];
 } Snap;
 
 typedef struct {
-    int pid;
-    char name[40];
-    char user[16];
+    int pid, ppid;
+    char name[40], user[16];
     char state;
-    unsigned long rss_kb;
-    unsigned long ticks;
+    unsigned long rss_kb, ticks;
     double cpu_pct;
 } Proc;
 
@@ -338,10 +380,12 @@ typedef struct {
 
 static PrevProc prev_tab[PREV_SLOTS];
 static int prev_n;
-static unsigned long long prev_cpu_total;
-static unsigned long long prev_cpu_idle;
-static int have_prev_cpu;
+static unsigned long long prev_cpu_total, prev_cpu_idle;
+static unsigned long long prev_core_total[MAX_CORES], prev_core_idle[MAX_CORES];
+static int prev_ncores, have_prev_cpu;
 static struct timespec prev_mono;
+static double cpu_hist[HIST];
+static int cpu_hist_n;
 
 static void snap_init(Snap *s)
 {
@@ -354,6 +398,7 @@ static void snap_init(Snap *s)
     copy_str(s->init, sizeof s->init, "unknown");
     copy_str(s->session, sizeof s->session, "-");
     copy_str(s->display, sizeof s->display, "-");
+    copy_str(s->fan_name, sizeof s->fan_name, "fan");
     s->cpu_pct = -1;
     s->cpu_cores = 1;
 }
@@ -410,46 +455,67 @@ static void collect_load_uptime(Snap *s)
         s->uptime_sec = strtod(buf, NULL);
 }
 
-static int read_cpu_times(unsigned long long *idle, unsigned long long *total)
+static void collect_cpu(Snap *s)
 {
     FILE *f = fopen("/proc/stat", "r");
-    char cpu[8];
+    char line[256], tag[16];
     unsigned long long user, nice, sys, id, iw, irq, sirq, st;
-    int ok;
-    if (!f)
-        return -1;
-    ok = fscanf(f, "%7s %llu %llu %llu %llu %llu %llu %llu %llu",
-                cpu, &user, &nice, &sys, &id, &iw, &irq, &sirq, &st);
-    fclose(f);
-    if (ok < 5)
-        return -1;
-    *idle = id + iw;
-    *total = user + nice + sys + id + iw + irq + sirq + st;
-    return 0;
-}
+    int ncore = 0;
 
-static void collect_cpu_pct2(Snap *s)
-{
-    unsigned long long idle, total;
-    if (read_cpu_times(&idle, &total) != 0)
+    if (!f)
         return;
-    s->cpu_idle = idle;
-    s->cpu_total = total;
-    if (have_prev_cpu && total > prev_cpu_total) {
-        unsigned long long dt = total - prev_cpu_total;
-        unsigned long long di = idle - prev_cpu_idle;
-        s->cpu_pct = 100.0 * (1.0 - (double)di / (double)dt);
-        if (s->cpu_pct < 0) s->cpu_pct = 0;
-        if (s->cpu_pct > 100) s->cpu_pct = 100;
-    } else {
-        unsigned long long i2, t2;
+    while (fgets(line, (int)sizeof line, f)) {
+        unsigned long long idle, total;
+        if (strncmp(line, "cpu", 3) != 0)
+            break;
+        if (sscanf(line, "%15s %llu %llu %llu %llu %llu %llu %llu %llu",
+                   tag, &user, &nice, &sys, &id, &iw, &irq, &sirq, &st) < 5)
+            continue;
+        idle = id + iw;
+        total = user + nice + sys + id + iw + irq + sirq + st;
+        if (strcmp(tag, "cpu") == 0) {
+            s->cpu_idle = idle;
+            s->cpu_total = total;
+            if (have_prev_cpu && total > prev_cpu_total) {
+                s->cpu_pct = 100.0 * (1.0 - (double)(idle - prev_cpu_idle) /
+                                      (double)(total - prev_cpu_total));
+                if (s->cpu_pct < 0) s->cpu_pct = 0;
+                if (s->cpu_pct > 100) s->cpu_pct = 100;
+            }
+        } else if (ncore < MAX_CORES) {
+            s->core_idle[ncore] = idle;
+            s->core_total[ncore] = total;
+            if (have_prev_cpu && ncore < prev_ncores &&
+                total > prev_core_total[ncore]) {
+                s->core_pct[ncore] = 100.0 * (1.0 - (double)(idle - prev_core_idle[ncore]) /
+                                              (double)(total - prev_core_total[ncore]));
+                if (s->core_pct[ncore] < 0) s->core_pct[ncore] = 0;
+                if (s->core_pct[ncore] > 100) s->core_pct[ncore] = 100;
+            }
+            ncore++;
+        }
+    }
+    fclose(f);
+    s->ncores = ncore;
+
+    if (!have_prev_cpu) {
         struct timespec ts = {0, (long)CPU_SAMPLE_MS * 1000000L};
         nanosleep(&ts, NULL);
-        if (read_cpu_times(&i2, &t2) == 0 && t2 > total) {
-            s->cpu_pct = 100.0 * (1.0 - (double)(i2 - idle) / (double)(t2 - total));
-            s->cpu_total = t2;
-            s->cpu_idle = i2;
-            if (s->cpu_pct < 0) s->cpu_pct = 0;
+        have_prev_cpu = 1;
+        prev_cpu_total = s->cpu_total;
+        prev_cpu_idle = s->cpu_idle;
+        prev_ncores = ncore;
+        memcpy(prev_core_total, s->core_total, sizeof prev_core_total);
+        memcpy(prev_core_idle, s->core_idle, sizeof prev_core_idle);
+        collect_cpu(s);
+        return;
+    }
+    if (s->cpu_pct >= 0) {
+        if (cpu_hist_n < HIST)
+            cpu_hist[cpu_hist_n++] = s->cpu_pct;
+        else {
+            memmove(cpu_hist, cpu_hist + 1, (HIST - 1) * sizeof cpu_hist[0]);
+            cpu_hist[HIST - 1] = s->cpu_pct;
         }
     }
 }
@@ -525,7 +591,7 @@ static void collect_temp(Snap *s)
     double best = 0;
     int found = 0;
     if (!d)
-        return;
+        goto hwmon;
     while ((e = readdir(d)) != NULL) {
         char typep[320], tempp[320], typ[64], tbuf[32];
         double c;
@@ -555,6 +621,50 @@ static void collect_temp(Snap *s)
     if (found) {
         s->have_temp = 1;
         s->temp_c = best;
+    }
+hwmon:
+    {
+        DIR *h = opendir("/sys/class/hwmon");
+        struct dirent *he;
+        int best_rpm = 0;
+        if (!h)
+            return;
+        while ((he = readdir(h)) != NULL) {
+            char base[128], path[192], buf[64], name[32];
+            int fi;
+            if (strncmp(he->d_name, "hwmon", 5) != 0)
+                continue;
+            snprintf(base, sizeof base, "/sys/class/hwmon/%.40s", he->d_name);
+            snprintf(path, sizeof path, "%s/name", base);
+            if (read_file(path, name, sizeof name) != 0)
+                copy_str(name, sizeof name, he->d_name);
+            if (!s->have_temp) {
+                snprintf(path, sizeof path, "%s/temp1_input", base);
+                if (read_file(path, buf, sizeof buf) == 0) {
+                    double c = atof(buf) / 1000.0;
+                    if (c > 0 && c < 150) {
+                        s->have_temp = 1;
+                        s->temp_c = c;
+                    }
+                }
+            }
+            for (fi = 1; fi <= 8; fi++) {
+                int rpm;
+                snprintf(path, sizeof path, "%s/fan%d_input", base, fi);
+                if (read_file(path, buf, sizeof buf) != 0)
+                    continue;
+                rpm = atoi(buf);
+                if (rpm > best_rpm) {
+                    best_rpm = rpm;
+                    copy_str(s->fan_name, sizeof s->fan_name, name);
+                }
+            }
+        }
+        closedir(h);
+        if (best_rpm > 0) {
+            s->have_fan = 1;
+            s->fan_rpm = best_rpm;
+        }
     }
 }
 
@@ -600,7 +710,6 @@ static void collect_session(Snap *s)
 {
     char comm[64];
     const char *st, *disp;
-
     if (read_file("/proc/1/comm", comm, sizeof comm) == 0) {
         if (strcmp(comm, "systemd") == 0)
             copy_str(s->init, sizeof s->init, "systemd");
@@ -617,7 +726,6 @@ static void collect_session(Snap *s)
     }
     if (access("/run/systemd/system", F_OK) == 0)
         copy_str(s->init, sizeof s->init, "systemd");
-
     st = getenv("XDG_SESSION_TYPE");
     if (st)
         copy_str(s->session, sizeof s->session, st);
@@ -625,7 +733,6 @@ static void collect_session(Snap *s)
         copy_str(s->session, sizeof s->session, "wayland");
     else if (getenv("DISPLAY"))
         copy_str(s->session, sizeof s->session, "x11");
-
     disp = getenv("DISPLAY");
     if (disp)
         copy_str(s->display, sizeof s->display, disp);
@@ -650,18 +757,15 @@ static int collect_procs(Proc *list, int max, Snap *s, double elapsed)
     long hz = sysconf(_SC_CLK_TCK);
     if (hz <= 0)
         hz = 100;
-
     d = opendir("/proc");
     if (!d)
         return 0;
     while ((e = readdir(d)) != NULL) {
         char path[96], buf[512];
         FILE *f;
-        char *lpar, *rpar;
-        int pid;
-        char state;
-        unsigned long utime = 0, stime = 0, dummy;
-        unsigned long ticks, rss_kb = 0;
+        char *lpar, *rpar, state;
+        int pid, ppid = 0;
+        unsigned long utime = 0, stime = 0, dummy, ticks, rss_kb = 0;
         Proc *p;
         struct passwd *pw;
         uid_t uid = (uid_t)-1;
@@ -671,7 +775,6 @@ static int collect_procs(Proc *list, int max, Snap *s, double elapsed)
         pid = atoi(e->d_name);
         if (pid <= 0)
             continue;
-
         snprintf(path, sizeof path, "/proc/%d/stat", pid);
         f = fopen(path, "r");
         if (!f)
@@ -686,12 +789,11 @@ static int collect_procs(Proc *list, int max, Snap *s, double elapsed)
         if (!lpar || !rpar || rpar <= lpar)
             continue;
         if (sscanf(rpar + 1,
-                   " %c %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu",
-                   &state, &dummy, &dummy, &dummy, &dummy, &dummy, &dummy,
+                   " %c %d %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu",
+                   &state, &ppid, &dummy, &dummy, &dummy, &dummy, &dummy,
                    &dummy, &dummy, &dummy, &dummy, &utime, &stime) < 13)
             continue;
         ticks = utime + stime;
-
         snprintf(path, sizeof path, "/proc/%d/status", pid);
         f = fopen(path, "r");
         if (f) {
@@ -706,12 +808,12 @@ static int collect_procs(Proc *list, int max, Snap *s, double elapsed)
             }
             fclose(f);
         }
-
         if (n >= max)
             continue;
         p = &list[n];
         memset(p, 0, sizeof *p);
         p->pid = pid;
+        p->ppid = ppid;
         p->state = state;
         p->rss_kb = rss_kb;
         p->ticks = ticks;
@@ -727,15 +829,10 @@ static int collect_procs(Proc *list, int max, Snap *s, double elapsed)
             copy_str(p->user, sizeof p->user, pw->pw_name);
         else
             snprintf(p->user, sizeof p->user, "%d", (int)uid);
-
         if (elapsed > 0.05) {
             unsigned long old = prev_lookup(pid);
             if (old && ticks >= old)
                 p->cpu_pct = 100.0 * (double)(ticks - old) / ((double)hz * elapsed);
-            else
-                p->cpu_pct = 0;
-        } else {
-            p->cpu_pct = 0;
         }
         if (p->cpu_pct > 999)
             p->cpu_pct = 999;
@@ -757,6 +854,9 @@ static void store_prev(const Proc *list, int n, const Snap *s)
     prev_n = m;
     prev_cpu_total = s->cpu_total;
     prev_cpu_idle = s->cpu_idle;
+    prev_ncores = s->ncores;
+    memcpy(prev_core_total, s->core_total, sizeof prev_core_total);
+    memcpy(prev_core_idle, s->core_idle, sizeof prev_core_idle);
     have_prev_cpu = 1;
     clock_gettime(CLOCK_MONOTONIC, &prev_mono);
 }
@@ -776,9 +876,14 @@ static int cmp_rss(const void *a, const void *b)
     const Proc *pa = a, *pb = b;
     if (pb->rss_kb > pa->rss_kb) return 1;
     if (pb->rss_kb < pa->rss_kb) return -1;
-    if (pb->cpu_pct > pa->cpu_pct) return 1;
-    if (pb->cpu_pct < pa->cpu_pct) return -1;
     return pa->pid - pb->pid;
+}
+
+static int cmp_name(const void *a, const void *b)
+{
+    const Proc *pa = a, *pb = b;
+    int c = strcasecmp(pa->name, pb->name);
+    return c ? c : (pa->pid - pb->pid);
 }
 
 static int proc_match(const Proc *p)
@@ -792,9 +897,21 @@ static int proc_match(const Proc *p)
            ci_contains(pidbuf, filter);
 }
 
+static int view_rows(void)
+{
+    struct winsize ws;
+    int rows = 24;
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_row >= 16)
+        rows = ws.ws_row;
+    rows -= 12;
+    if (rows < 8) rows = 8;
+    if (rows > 40) rows = 40;
+    return rows;
+}
+
 static void rebuild_view(const Proc *procs, int nprocs)
 {
-    int i, found = -1;
+    int i, found = -1, vr = view_rows();
     nview = 0;
     for (i = 0; i < nprocs; i++) {
         if (!proc_match(&procs[i]))
@@ -803,12 +920,11 @@ static void rebuild_view(const Proc *procs, int nprocs)
             view_idx[nview++] = i;
     }
     if (selected_pid) {
-        for (i = 0; i < nview; i++) {
+        for (i = 0; i < nview; i++)
             if (procs[view_idx[i]].pid == selected_pid) {
                 found = i;
                 break;
             }
-        }
     }
     if (found >= 0)
         sel = found;
@@ -818,8 +934,8 @@ static void rebuild_view(const Proc *procs, int nprocs)
         sel = 0;
     if (sel < scroll)
         scroll = sel;
-    if (sel >= scroll + VIEW_PROCS)
-        scroll = sel - VIEW_PROCS + 1;
+    if (sel >= scroll + vr)
+        scroll = sel - vr + 1;
     if (scroll < 0)
         scroll = 0;
     if (nview)
@@ -830,26 +946,25 @@ static void collect(Snap *s, Proc *procs, int *nprocs)
 {
     struct timespec now_mono;
     double elapsed = 0;
-
     snap_init(s);
     collect_identity(s);
     collect_load_uptime(s);
-    collect_cpu_pct2(s);
+    collect_cpu(s);
     collect_mem(s);
     collect_disk(s);
     collect_battery(s);
     collect_temp(s);
     collect_net(s);
     collect_session(s);
-
     clock_gettime(CLOCK_MONOTONIC, &now_mono);
-    if (prev_mono.tv_sec || prev_mono.tv_nsec) {
+    if (prev_mono.tv_sec || prev_mono.tv_nsec)
         elapsed = (double)(now_mono.tv_sec - prev_mono.tv_sec) +
                   (double)(now_mono.tv_nsec - prev_mono.tv_nsec) / 1e9;
-    }
     *nprocs = collect_procs(procs, MAX_PROCS, s, elapsed);
     if (sort_mode == SORT_RSS)
         qsort(procs, (size_t)*nprocs, sizeof *procs, cmp_rss);
+    else if (sort_mode == SORT_NAME)
+        qsort(procs, (size_t)*nprocs, sizeof *procs, cmp_name);
     else
         qsort(procs, (size_t)*nprocs, sizeof *procs, cmp_cpu);
     store_prev(procs, *nprocs, s);
@@ -864,16 +979,8 @@ static int term_cols(void)
     return 80;
 }
 
-static void frame_begin(void)
-{
-    fputs("\033[H", stdout);
-}
-
-static void frame_end(void)
-{
-    fputs("\033[J", stdout);
-    fflush(stdout);
-}
+static void frame_begin(void) { fputs("\033[H", stdout); }
+static void frame_end(void) { fputs("\033[J", stdout); fflush(stdout); }
 
 static void live_enter(void)
 {
@@ -902,356 +1009,381 @@ static void live_leave(void)
     live_mode = 0;
 }
 
-static void hrule(int w)
+static const char *ch_tl(void) { return use_unicode ? "╭" : "+"; }
+static const char *ch_tr(void) { return use_unicode ? "╮" : "+"; }
+static const char *ch_bl(void) { return use_unicode ? "╰" : "+"; }
+static const char *ch_br(void) { return use_unicode ? "╯" : "+"; }
+static const char *ch_h(void) { return use_unicode ? "─" : "-"; }
+static const char *ch_v(void) { return use_unicode ? "│" : "|"; }
+
+static void box_top(int w, const char *title)
 {
-    int i;
-    fg(RGB_LEAF);
-    fputs("  ", stdout);
-    if (use_unicode) {
-        for (i = 0; i < w - 2; i++)
-            fputs("─", stdout);
+    int i, inner, tlen;
+    fg(C_BOX);
+    fputs(ch_tl(), stdout);
+    fputs(ch_h(), stdout);
+    if (title && title[0]) {
+        fg(C_ACC2);
+        bold();
+        printf(" %s ", title);
+        reset_col();
+        fg(C_BOX);
+        tlen = (int)strlen(title) + 3;
     } else {
-        for (i = 0; i < w - 2; i++)
-            fputc('-', stdout);
+        tlen = 1;
     }
+    inner = w - 2 - tlen;
+    if (inner < 0)
+        inner = 0;
+    for (i = 0; i < inner; i++)
+        fputs(ch_h(), stdout);
+    fputs(ch_tr(), stdout);
     reset_col();
     nl();
 }
 
-static void label(const char *tag)
+static void box_bot(int w)
 {
-    fg(RGB_ICE);
-    bold();
-    printf("  %-8s", tag);
+    int i;
+    fg(C_BOX);
+    fputs(ch_bl(), stdout);
+    for (i = 0; i < w - 2; i++)
+        fputs(ch_h(), stdout);
+    fputs(ch_br(), stdout);
     reset_col();
-    fputs("  ", stdout);
+    nl();
 }
 
-static void render_header(const Snap *s, int w, int watch)
+static void box_begin(void)
+{
+    fg(C_BOX);
+    fputs(ch_v(), stdout);
+    reset_col();
+    fputc(' ', stdout);
+}
+
+static void box_end(int w)
+{
+    if (is_tty())
+        printf("\033[%dG", w);
+    fg(C_BOX);
+    fputs(ch_v(), stdout);
+    reset_col();
+    nl();
+}
+
+static const char *sort_label(void)
+{
+    if (sort_mode == SORT_RSS) return "mem";
+    if (sort_mode == SORT_NAME) return "name";
+    return "cpu";
+}
+
+static const char *theme_label(void)
+{
+    if (theme_id == THEME_ICE) return "ice";
+    if (theme_id == THEME_DIM) return "dim";
+    return "mint";
+}
+
+static void render_header(const Snap *s, int w)
 {
     char clock[16], up[32];
     time_t t = time(NULL);
     struct tm *tm = localtime(&t);
-    const char *pg = (page == PAGE_PROC) ? "PROC.VIEW" : "SYS.CARD";
-
     if (tm)
         strftime(clock, sizeof clock, "%H:%M:%S", tm);
     else
         copy_str(clock, sizeof clock, "--:--:--");
     human_secs(s->uptime_sec, up, sizeof up);
 
-    fg(RGB_MINT);
+    fg(C_ACC);
     bold();
-    if (use_unicode)
-        printf("  ░▒▓");
-    else
-        printf("  ===");
-    fg(RGB_MINT2);
-    printf("  PEPSTAT");
-    fg(RGB_FOG);
-    printf("  //  %s  v3", pg);
+    printf(" pepstat");
     reset_col();
-    fg(RGB_ICE);
-    printf("    %s", clock);
-    if (watch) {
-        fg(RGB_MINT);
-        printf("  [LIVE]");
-    }
+    fg(C_SLATE);
+    printf("  %s", s->hostname);
+    printf("  ·  %s", s->pretty_os);
+    printf("  ·  %s/%s", s->init, s->session);
+    printf("  ·  %s", theme_label());
+    fg(C_ICE);
+    printf("   %s", clock);
+    fg(C_SLATE);
+    printf("   up %s", up);
     reset_col();
     nl();
-
-    fg(RGB_SLATE);
-    printf("  host ");
-    fg(RGB_WHITE);
-    printf("%s", s->hostname);
-    fg(RGB_SLATE);
-    printf("   ·   ");
-    fg(RGB_FOG);
-    printf("%s", s->pretty_os);
-    reset_col();
-    nl();
-    fg(RGB_SLATE);
-    printf("  link ");
-    fg(RGB_ICE);
-    printf("%s", s->session);
-    fg(RGB_SLATE);
-    printf(" %s   ·   init ", s->display);
-    fg(RGB_MINT2);
-    printf("%s", s->init);
-    fg(RGB_SLATE);
-    printf("   ·   up %s", up);
-    reset_col();
-    nl();
-    hrule(w);
+    (void)w;
 }
 
 static void render_footer(int w, int watch)
 {
-    hrule(w);
+    box_bot(w);
     if (confirm_sig) {
-        fg(RGB_ROSE);
+        fg(C_ROSE);
         bold();
-        printf("  CONFIRM %s pid %d ?   y yes   n / esc cancel",
+        printf("  CONFIRM %s pid %d ?   y / n",
                confirm_sig == SIGKILL ? "KILL" : "TERM", selected_pid);
         reset_col();
         nl();
         return;
     }
     if (filter_edit) {
-        fg(RGB_AMBER);
-        printf("  FILTER> %s█   esc abort   enter apply", filter);
+        fg(C_AMBER);
+        printf("  FILTER> %s█", filter);
+        fg(C_SLATE);
+        printf("   enter apply  esc clear");
         reset_col();
         nl();
         return;
     }
     if (status_msg[0]) {
-        fg(RGB_AMBER);
+        fg(C_AMBER);
         printf("  %s", status_msg);
         reset_col();
         nl();
         return;
     }
-    fg(RGB_SLATE);
-    if (watch) {
-        printf("  ");
-        fg(RGB_MINT2); printf("1"); fg(RGB_SLATE); printf(" dash  ");
-        fg(RGB_MINT2); printf("2"); fg(RGB_SLATE); printf(" procs  ");
-        fg(RGB_MINT2); printf("c"); fg(RGB_SLATE); printf("/");
-        fg(RGB_MINT2); printf("m"); fg(RGB_SLATE); printf(" sort  ");
-        fg(RGB_MINT2); printf("/"); fg(RGB_SLATE); printf(" find  ");
-        fg(RGB_MINT2); printf("j"); fg(RGB_SLATE); printf("/");
-        fg(RGB_MINT2); printf("k"); fg(RGB_SLATE); printf(" move  ");
-        fg(RGB_MINT2); printf("t"); fg(RGB_SLATE); printf(" term  ");
-        fg(RGB_ROSE);  printf("K"); fg(RGB_SLATE); printf(" kill  ");
-        fg(RGB_ROSE);  printf("q"); fg(RGB_SLATE); printf(" quit");
-    } else {
-        printf("  flags: -w live  -p procs  --plain  --json  --no-color  --ascii");
-    }
-    reset_col();
-    nl();
-    (void)w;
-}
-
-static void metric_row(const char *tag, double pct, const char *rhs)
-{
-    label(tag);
-    bar(pct, 26);
-    printf("  ");
-    fg(RGB_WHITE);
-    printf("%s", rhs);
+    fg(C_SLATE);
+    if (watch)
+        printf("  1 dash  2 proc  c/m/n sort  / find  j/k move  u parent  t term  K kill  q");
+    else
+        printf("  -w live  -p procs  --plain  --mint --ice --dim  --json");
     reset_col();
     nl();
 }
 
 static void render_dash(const Snap *s, const Proc *procs, int nprocs, int w, int watch)
 {
-    char a[32], b[32], rhs[256];
-    int show, i;
+    char a[32], b[32], title[80];
+    double mem_pct = 0, disk_pct = 0, home_pct = 0, swap_pct = 0;
+    int i, show, cores, per_row, barw;
 
-    render_header(s, w, watch);
+    render_header(s, w);
 
-    if (s->cpu_pct >= 0) {
-        snprintf(rhs, sizeof rhs, "%5.1f%%   %d cores   %s",
-                 s->cpu_pct, s->cpu_cores, s->cpu_model);
-        metric_row("CPU", s->cpu_pct, rhs);
-    }
-    {
-        double per = s->cpu_cores > 0 ? s->load1 / s->cpu_cores : s->load1;
-        int lvl = per >= 1.5 ? 2 : per >= 1.0 ? 1 : 0;
-        label("LOAD");
-        fg_level(lvl);
-        printf("%5.2f  %5.2f  %5.2f", s->load1, s->load5, s->load15);
-        reset_col();
-        fg(RGB_SLATE);
-        printf("    1 / 5 / 15 min");
-        reset_col();
-        nl();
-    }
-    if (s->have_temp) {
-        int lvl = s->temp_c >= CRIT_TEMP_C ? 2 : s->temp_c >= WARN_TEMP_C ? 1 : 0;
-        label("TEMP");
-        fg_level(lvl);
-        printf("%5.1f C", s->temp_c);
-        reset_col();
-        nl();
-    }
+    snprintf(title, sizeof title, "cpu %.0f%%", s->cpu_pct < 0 ? 0 : s->cpu_pct);
+    box_top(w, title);
+    box_begin();
+    spark(cpu_hist, cpu_hist_n, w - 18);
+    fputs("  ", stdout);
+    bar(s->cpu_pct < 0 ? 0 : s->cpu_pct, 10);
+    fg(C_WHITE);
+    printf(" %5.1f%%", s->cpu_pct < 0 ? 0 : s->cpu_pct);
+    reset_col();
+    box_end(w);
 
+    box_begin();
+    fg(C_SLATE);
+    printf("%s   load %.2f %.2f %.2f", s->cpu_model, s->load1, s->load5, s->load15);
+    reset_col();
+    box_end(w);
+
+    cores = s->ncores > 0 ? s->ncores : s->cpu_cores;
+    if (cores > MAX_CORES)
+        cores = MAX_CORES;
+    per_row = (w - 4) / 16;
+    if (per_row < 1)
+        per_row = 1;
+    if (per_row > 8)
+        per_row = 8;
+    for (i = 0; i < cores; ) {
+        int k;
+        box_begin();
+        for (k = 0; k < per_row && i < cores; k++, i++) {
+            fg(C_SLATE);
+            printf("%2d ", i);
+            bar(s->core_pct[i], 8);
+            fg(C_FOG);
+            printf(" %3.0f%%  ", s->core_pct[i]);
+            reset_col();
+        }
+        box_end(w);
+    }
+    box_bot(w);
+
+    if (s->mem_total_kb)
+        mem_pct = 100.0 * (double)(s->mem_total_kb - s->mem_avail_kb) / (double)s->mem_total_kb;
+    if (s->swap_total_kb)
+        swap_pct = 100.0 * (double)(s->swap_total_kb - s->swap_free_kb) / (double)s->swap_total_kb;
+    if (s->disk_total)
+        disk_pct = 100.0 * (double)(s->disk_total - s->disk_free) / (double)s->disk_total;
+    if (s->have_home && s->home_total)
+        home_pct = 100.0 * (double)(s->home_total - s->home_free) / (double)s->home_total;
+
+    snprintf(title, sizeof title, "mem %.0f%%", mem_pct);
+    box_top(w, title);
+    box_begin();
+    barw = w > 70 ? 28 : 18;
     if (s->mem_total_kb) {
-        double used = (double)(s->mem_total_kb - s->mem_avail_kb);
-        double pct = 100.0 * used / (double)s->mem_total_kb;
-        human_bytes(used * 1024.0, a, sizeof a);
+        human_bytes((double)(s->mem_total_kb - s->mem_avail_kb) * 1024.0, a, sizeof a);
         human_bytes((double)s->mem_total_kb * 1024.0, b, sizeof b);
-        snprintf(rhs, sizeof rhs, "%s / %s   %.0f%%", a, b, pct);
-        metric_row("MEM", pct, rhs);
+        fg(C_ICE);
+        printf("RAM  ");
+        bar(mem_pct, barw);
+        fg(C_WHITE);
+        printf("  %s/%s", a, b);
     }
+    reset_col();
+    box_end(w);
+    box_begin();
+    fg(C_ICE);
+    printf("SWP  ");
     if (s->swap_total_kb) {
-        double used = (double)(s->swap_total_kb - s->swap_free_kb);
-        double pct = 100.0 * used / (double)s->swap_total_kb;
-        human_bytes(used * 1024.0, a, sizeof a);
+        human_bytes((double)(s->swap_total_kb - s->swap_free_kb) * 1024.0, a, sizeof a);
         human_bytes((double)s->swap_total_kb * 1024.0, b, sizeof b);
-        snprintf(rhs, sizeof rhs, "%s / %s   %.0f%%", a, b, pct);
-        metric_row("SWAP", pct, rhs);
+        bar(swap_pct, barw);
+        fg(C_WHITE);
+        printf("  %s/%s", a, b);
     } else {
-        label("SWAP");
-        fg(RGB_SLATE);
+        fg(C_SLATE);
         printf("none");
-        reset_col();
-        nl();
     }
-    if (s->disk_total) {
-        double used = (double)(s->disk_total - s->disk_free);
-        double pct = 100.0 * used / (double)s->disk_total;
-        human_bytes(used, a, sizeof a);
-        human_bytes((double)s->disk_total, b, sizeof b);
-        snprintf(rhs, sizeof rhs, "%s / %s   %.0f%%", a, b, pct);
-        metric_row("DISK", pct, rhs);
-    }
-    if (s->have_home && s->home_total) {
-        double used = (double)(s->home_total - s->home_free);
-        double pct = 100.0 * used / (double)s->home_total;
-        human_bytes(used, a, sizeof a);
+    reset_col();
+    box_end(w);
+    box_begin();
+    human_bytes((double)(s->disk_total - s->disk_free), a, sizeof a);
+    human_bytes((double)s->disk_total, b, sizeof b);
+    fg(C_ICE);
+    printf("/    ");
+    bar(disk_pct, barw);
+    fg(C_WHITE);
+    printf("  %s/%s", a, b);
+    reset_col();
+    box_end(w);
+    if (s->have_home) {
+        box_begin();
+        human_bytes((double)(s->home_total - s->home_free), a, sizeof a);
         human_bytes((double)s->home_total, b, sizeof b);
-        snprintf(rhs, sizeof rhs, "%s / %s   %.0f%%", a, b, pct);
-        metric_row("HOME", pct, rhs);
+        fg(C_ICE);
+        printf("~    ");
+        bar(home_pct, barw);
+        fg(C_WHITE);
+        printf("  %s/%s", a, b);
+        reset_col();
+        box_end(w);
     }
+    box_bot(w);
 
-    label("NET");
-    fg(RGB_ICE2);
-    printf("%s", s->iface);
-    reset_col();
-    fg(RGB_WHITE);
-    printf("   %s", s->ipv4);
-    reset_col();
-    nl();
-
+    box_top(w, "sys");
+    box_begin();
+    fg(C_FOG);
+    printf("%s  %s", s->iface, s->ipv4);
+    if (s->have_temp) {
+        fg(C_SLATE);
+        printf("   ·   ");
+        fg_level(s->temp_c >= CRIT_TEMP_C ? 2 : s->temp_c >= WARN_TEMP_C ? 1 : 0);
+        printf("%.1fC", s->temp_c);
+    }
+    if (s->have_fan) {
+        fg(C_SLATE);
+        printf("   ·   ");
+        fg(C_ACC);
+        printf("%s %d rpm", s->fan_name, s->fan_rpm);
+    }
     if (s->have_bat) {
         int lvl = 0;
         if (strcasecmp(s->bat_status, "Discharging") == 0) {
             if (s->bat_pct <= CRIT_BAT_PCT) lvl = 2;
             else if (s->bat_pct <= WARN_BAT_PCT) lvl = 1;
         }
-        snprintf(rhs, sizeof rhs, "%d%%   %s", s->bat_pct, s->bat_status);
-        label("BATT");
-        bar((double)s->bat_pct, 26);
-        printf("  ");
+        fg(C_SLATE);
+        printf("   ·   ");
         fg_level(lvl);
-        printf("%s", rhs);
-        reset_col();
-        nl();
+        printf("bat %d%% %s", s->bat_pct, s->bat_status);
     }
-
-    label("TASKS");
-    fg(RGB_MINT2);
-    printf("%d", s->nprocs);
-    fg(RGB_SLATE);
-    printf(" procs   ");
-    fg(RGB_ICE);
-    printf("%d", s->nthreads);
-    fg(RGB_SLATE);
-    printf(" threads");
     reset_col();
-    nl();
-
-    hrule(w);
-    fg(RGB_ICE);
-    printf("  TOP.%s", sort_mode == SORT_RSS ? "RSS" : "CPU");
+    box_end(w);
+    box_begin();
+    fg(C_SLATE);
+    printf("%d procs  %d threads  %s", s->nprocs, s->nthreads, s->kernel);
     reset_col();
-    nl();
-    show = nprocs < 6 ? nprocs : 6;
+    box_end(w);
+    box_bot(w);
+
+    snprintf(title, sizeof title, "proc  %s", sort_label());
+    box_top(w, title);
+    box_begin();
+    fg(C_LEAF);
+    printf("  PID   PPID USER       CPU    MEM  ST  NAME");
+    reset_col();
+    box_end(w);
+    show = nprocs < 8 ? nprocs : 8;
     for (i = 0; i < show; i++) {
         human_bytes((double)procs[i].rss_kb * 1024.0, a, sizeof a);
-        fg(RGB_SLATE);
-        printf("  %5d  ", procs[i].pid);
-        fg(RGB_FOG);
+        box_begin();
+        fg(C_SLATE);
+        printf("%5d %6d ", procs[i].pid, procs[i].ppid);
+        fg(C_FOG);
         printf("%-8s ", procs[i].user);
-        if (procs[i].cpu_pct >= 50)
-            fg(RGB_ROSE);
-        else if (procs[i].cpu_pct >= 15)
-            fg(RGB_AMBER);
-        else
-            fg(RGB_MINT);
+        fg_level(pct_level(procs[i].cpu_pct));
         printf("%5.1f%% ", procs[i].cpu_pct);
-        fg(RGB_ICE);
-        printf("%6s  ", a);
-        fg(RGB_WHITE);
+        fg(C_ICE);
+        printf("%5s ", a);
+        fg(C_SLATE);
+        printf("%c  ", procs[i].state);
+        fg(C_WHITE);
         printf("%s", procs[i].name);
         reset_col();
-        nl();
+        box_end(w);
     }
-
     render_footer(w, watch);
 }
 
 static void render_proc(const Snap *s, const Proc *procs, int nprocs, int w, int watch)
 {
-    char a[64];
-    int i, show, cols, namew, shown;
-    const char *sortname = sort_mode == SORT_RSS ? "RSS" : "CPU";
-
+    char a[32], title[96];
+    int i, vr, show, namew;
     (void)nprocs;
-    render_header(s, w, watch);
-    fg(RGB_ICE);
-    printf("  PROCESS MATRIX");
-    fg(RGB_SLATE);
-    printf("   sort=%s", sortname);
-    if (filter[0]) {
-        fg(RGB_AMBER);
-        printf("   /%s", filter);
-    }
-    fg(RGB_SLATE);
-    shown = nview < VIEW_PROCS ? nview : VIEW_PROCS;
-    printf("   %d/%d", shown, nview);
+    render_header(s, w);
+    snprintf(title, sizeof title, "proc  %s%s%s  %d/%d",
+             sort_label(),
+             filter[0] ? "  /" : "",
+             filter[0] ? filter : "",
+             nview < view_rows() ? nview : view_rows(), nview);
+    box_top(w, title);
+    box_begin();
+    fg(C_LEAF);
+    printf("  PID   PPID USER       CPU    MEM  ST  NAME");
     reset_col();
-    nl();
-    fg(RGB_LEAF);
-    printf("    PID    USER       CPU     RSS   ST  NAME");
-    reset_col();
-    nl();
-
-    cols = term_cols();
-    namew = cols - 42;
-    if (namew < 8)
-        namew = 8;
-
-    show = nview < scroll + VIEW_PROCS ? nview : scroll + VIEW_PROCS;
+    box_end(w);
+    vr = view_rows();
+    show = nview < scroll + vr ? nview : scroll + vr;
+    namew = w - 44;
+    if (namew < 8) namew = 8;
     for (i = scroll; i < show; i++) {
         const Proc *p = &procs[view_idx[i]];
         int on = (i == sel);
         human_bytes((double)p->rss_kb * 1024.0, a, sizeof a);
+        box_begin();
+        if (on)
+            bg(C_SEL);
         if (on) {
-            bg(RGB_SELBG);
-            fg(RGB_MINT2);
-            printf(" ▸");
+            fg(C_ACC2);
+            printf("▸");
         } else {
-            printf("  ");
+            printf(" ");
         }
         if (on)
-            fg(RGB_WHITE);
+            fg(C_WHITE);
         else
-            fg(RGB_SLATE);
-        printf(" %-5d  ", p->pid);
-        fg(RGB_FOG);
-        printf("%-8s  ", p->user);
-        if (p->cpu_pct >= 50)
-            fg(RGB_ROSE);
-        else if (p->cpu_pct >= 15)
-            fg(RGB_AMBER);
-        else
-            fg(RGB_MINT2);
-        printf("%5.1f%%  ", p->cpu_pct);
-        fg(RGB_ICE);
-        printf("%6s  ", a);
+            fg(C_SLATE);
+        printf("%5d %6d ", p->pid, p->ppid);
+        fg(C_FOG);
+        printf("%-8s ", p->user);
+        fg_level(pct_level(p->cpu_pct));
+        printf("%5.1f%% ", p->cpu_pct);
+        fg(C_ICE);
+        printf("%5s ", a);
         if (p->state == 'R')
-            fg(RGB_MINT2);
-        else if (p->state == 'Z' || p->state == 'X')
-            fg(RGB_ROSE);
+            fg(C_ACC2);
+        else if (p->state == 'Z')
+            fg(C_ROSE);
         else
-            fg(RGB_SLATE);
-        printf("%c   ", p->state);
-        fg(RGB_WHITE);
+            fg(C_SLATE);
+        printf("%c  ", p->state);
+        fg(C_WHITE);
         printf("%.*s", namew, p->name);
         reset_col();
-        nl();
+        box_end(w);
     }
     render_footer(w, watch);
 }
@@ -1265,13 +1397,14 @@ static void render_plain(const Snap *s)
         disk = 100.0 * (double)(s->disk_total - s->disk_free) / (double)s->disk_total;
     if (s->have_home && s->home_total)
         home = 100.0 * (double)(s->home_total - s->home_free) / (double)s->home_total;
-
     printf("cpu %.0f%%  mem %.0f%%  disk %.0f%%  home %.0f%%  load %.2f",
            s->cpu_pct < 0 ? 0 : s->cpu_pct, mem, disk, home, s->load1);
     if (s->have_bat)
         printf("  bat %d%%", s->bat_pct);
     if (s->have_temp)
         printf("  temp %.0fC", s->temp_c);
+    if (s->have_fan)
+        printf("  fan %d", s->fan_rpm);
     printf("\n");
 }
 
@@ -1281,59 +1414,72 @@ static void render_json(const Snap *s, const Proc *procs, int nprocs)
     printf("{\n");
     printf("  \"hostname\": \"%s\",\n", s->hostname);
     printf("  \"os\": \"%s\",\n", s->pretty_os);
-    printf("  \"kernel\": \"%s\",\n", s->kernel);
-    printf("  \"init\": \"%s\",\n", s->init);
-    printf("  \"session\": \"%s\",\n", s->session);
-    printf("  \"uptime_sec\": %.0f,\n", s->uptime_sec);
     printf("  \"cpu_pct\": %.1f,\n", s->cpu_pct);
-    printf("  \"cpu_cores\": %d,\n", s->cpu_cores);
+    printf("  \"cpu_cores\": %d,\n", s->ncores);
     printf("  \"load\": [%.2f, %.2f, %.2f],\n", s->load1, s->load5, s->load15);
     printf("  \"mem_total_kb\": %lu,\n", s->mem_total_kb);
     printf("  \"mem_avail_kb\": %lu,\n", s->mem_avail_kb);
-    printf("  \"disk_total\": %lu,\n", s->disk_total);
-    printf("  \"disk_free\": %lu,\n", s->disk_free);
-    printf("  \"home_total\": %lu,\n", s->home_total);
-    printf("  \"home_free\": %lu,\n", s->home_free);
+    printf("  \"fan_rpm\": %d,\n", s->have_fan ? s->fan_rpm : 0);
     printf("  \"nprocs\": %d,\n", s->nprocs);
-    printf("  \"nthreads\": %d,\n", s->nthreads);
     printf("  \"top\": [\n");
-    for (i = 0; i < show; i++) {
-        printf("    {\"pid\": %d, \"user\": \"%s\", \"cpu\": %.1f, \"rss_kb\": %lu, \"name\": \"%s\"}%s\n",
-               procs[i].pid, procs[i].user, procs[i].cpu_pct, procs[i].rss_kb,
-               procs[i].name, i + 1 < show ? "," : "");
-    }
+    for (i = 0; i < show; i++)
+        printf("    {\"pid\": %d, \"ppid\": %d, \"user\": \"%s\", \"cpu\": %.1f, \"rss_kb\": %lu, \"name\": \"%s\"}%s\n",
+               procs[i].pid, procs[i].ppid, procs[i].user, procs[i].cpu_pct,
+               procs[i].rss_kb, procs[i].name, i + 1 < show ? "," : "");
     printf("  ]\n}\n");
 }
 
 static void usage(const char *argv0)
 {
     fprintf(stderr,
-            "usage: %s [-w] [-p] [--plain] [-n SEC] [--json] [--no-color] [--ascii] [-h]\n"
-            "  -w, --watch     live HUD (no flicker)\n"
-            "  -p, --procs     process table once\n"
-            "  --plain         one line for XFCE Generic Monitor\n"
-            "  -n SEC          refresh interval (default %d)\n"
-            " live: 1 dash  2 procs  / find  j/k move  t TERM  K KILL\n",
-            argv0, WATCH_DEFAULT_SEC);
+            "usage: %s [-w] [-p] [--plain] [--mint|--ice|--dim] [--json] [--ascii]\n"
+            " live: 1 dash  2 proc  c/m/n sort  / find  j/k  u parent  t TERM  K KILL\n",
+            argv0);
 }
 
-static volatile sig_atomic_t got_winch;
-static volatile sig_atomic_t got_exit;
-
+static volatile sig_atomic_t got_winch, got_exit;
 static void on_winch(int sig) { (void)sig; got_winch = 1; }
 static void on_exit_sig(int sig) { (void)sig; got_exit = 1; }
 
 static void move_sel(int delta, const Proc *procs)
 {
+    int vr = view_rows();
     if (!nview)
         return;
     sel += delta;
     if (sel < 0) sel = 0;
     if (sel >= nview) sel = nview - 1;
     if (sel < scroll) scroll = sel;
-    if (sel >= scroll + VIEW_PROCS) scroll = sel - VIEW_PROCS + 1;
+    if (sel >= scroll + vr) scroll = sel - vr + 1;
     selected_pid = procs[view_idx[sel]].pid;
     page = PAGE_PROC;
+}
+
+static void jump_parent(const Proc *procs)
+{
+    int i, ppid;
+    if (!nview)
+        return;
+    page = PAGE_PROC;
+    ppid = procs[view_idx[sel]].ppid;
+    if (ppid <= 0) {
+        copy_str(status_msg, sizeof status_msg, "no parent");
+        return;
+    }
+    for (i = 0; i < nview; i++) {
+        if (procs[view_idx[i]].pid == ppid) {
+            sel = i;
+            selected_pid = ppid;
+            if (sel < scroll) scroll = sel;
+            if (sel >= scroll + view_rows())
+                scroll = sel - view_rows() + 1;
+            return;
+        }
+    }
+    /* parent exists but filtered out — select by pid in full list */
+    for (i = 0; i < nview; i++)
+        ;
+    snprintf(status_msg, sizeof status_msg, "parent %d not in view (clear filter?)", ppid);
 }
 
 static void request_signal(int sig, const Proc *procs)
@@ -1398,12 +1544,12 @@ static int read_key(char *out)
 int main(int argc, char **argv)
 {
     int watch = 0, json = 0, once_proc = 0, plain = 0;
-    int interval = WATCH_DEFAULT_SEC;
-    int i;
-    Snap s;
+    int interval = WATCH_DEFAULT_SEC, i;
+    Snap snap;
     Proc procs[MAX_PROCS];
     int nprocs = 0;
 
+    apply_theme(THEME_MINT);
     for (i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-w") || !strcmp(argv[i], "--watch"))
             watch = 1;
@@ -1417,13 +1563,18 @@ int main(int argc, char **argv)
             use_color = 0;
         else if (!strcmp(argv[i], "--ascii"))
             use_unicode = 0;
+        else if (!strcmp(argv[i], "--mint"))
+            apply_theme(THEME_MINT);
+        else if (!strcmp(argv[i], "--ice"))
+            apply_theme(THEME_ICE);
+        else if (!strcmp(argv[i], "--dim"))
+            apply_theme(THEME_DIM);
         else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
             usage(argv[0]);
             return 0;
         } else if ((!strcmp(argv[i], "-n") || !strcmp(argv[i], "--interval")) && i + 1 < argc) {
             interval = atoi(argv[++i]);
-            if (interval < 1)
-                interval = 1;
+            if (interval < 1) interval = 1;
         } else {
             usage(argv[0]);
             return 2;
@@ -1436,21 +1587,15 @@ int main(int argc, char **argv)
 
     if (json || plain || !watch) {
         struct timespec gap = {0, 200L * 1000000L};
-        collect(&s, procs, &nprocs);
+        collect(&snap, procs, &nprocs);
         nanosleep(&gap, NULL);
-        collect(&s, procs, &nprocs);
-        if (json) {
-            render_json(&s, procs, nprocs);
-            return 0;
-        }
-        if (plain) {
-            render_plain(&s);
-            return 0;
-        }
+        collect(&snap, procs, &nprocs);
+        if (json) { render_json(&snap, procs, nprocs); return 0; }
+        if (plain) { render_plain(&snap); return 0; }
         if (page == PAGE_PROC)
-            render_proc(&s, procs, nprocs, term_cols(), 0);
+            render_proc(&snap, procs, nprocs, term_cols(), 0);
         else
-            render_dash(&s, procs, nprocs, term_cols(), 0);
+            render_dash(&snap, procs, nprocs, term_cols(), 0);
         return 0;
     }
 
@@ -1458,114 +1603,93 @@ int main(int argc, char **argv)
     signal(SIGINT, on_exit_sig);
     signal(SIGTERM, on_exit_sig);
     live_enter();
-
     {
         int flags = fcntl(STDIN_FILENO, F_GETFL, 0);
         if (flags >= 0)
             fcntl(STDIN_FILENO, F_SETFL, flags | O_NONBLOCK);
     }
-
-    collect(&s, procs, &nprocs);
+    collect(&snap, procs, &nprocs);
     {
         struct timespec now, next;
         int dirty = 1;
         clock_gettime(CLOCK_MONOTONIC, &now);
         next = now;
         next.tv_sec += interval;
-
         for (;;) {
             char key;
             struct timespec sl = {0, 30L * 1000000L};
-
             if (got_exit)
                 break;
             if (got_winch) {
                 got_winch = 0;
                 dirty = 1;
             }
-
             clock_gettime(CLOCK_MONOTONIC, &now);
             if (!filter_edit && !confirm_sig &&
                 (now.tv_sec > next.tv_sec ||
                  (now.tv_sec == next.tv_sec && now.tv_nsec >= next.tv_nsec))) {
-                collect(&s, procs, &nprocs);
+                collect(&snap, procs, &nprocs);
                 next = now;
                 next.tv_sec += interval;
                 dirty = 1;
             }
-
             if (dirty) {
-                int w = term_cols();
+                int ww = term_cols();
                 frame_begin();
                 if (page == PAGE_PROC)
-                    render_proc(&s, procs, nprocs, w, 1);
+                    render_proc(&snap, procs, nprocs, ww, 1);
                 else
-                    render_dash(&s, procs, nprocs, w, 1);
+                    render_dash(&snap, procs, nprocs, ww, 1);
                 frame_end();
                 dirty = 0;
             }
-
             if (!read_key(&key)) {
                 nanosleep(&sl, NULL);
                 continue;
             }
-
             if (confirm_sig) {
-                if (key == 'y' || key == 'Y') {
-                    apply_signal();
-                    dirty = 1;
-                } else if (key == 'n' || key == 'N' || key == 0x1b || key == 'q') {
-                    confirm_sig = 0;
-                    dirty = 1;
+                if (key == 'y' || key == 'Y') { apply_signal(); dirty = 1; }
+                else if (key == 'n' || key == 'N' || key == 0x1b || key == 'q') {
+                    confirm_sig = 0; dirty = 1;
                 }
                 continue;
             }
-
             if (filter_edit) {
                 size_t fl = strlen(filter);
                 if (key == 0x1b) {
-                    filter_edit = 0;
-                    filter[0] = '\0';
-                    rebuild_view(procs, nprocs);
-                    dirty = 1;
+                    filter_edit = 0; filter[0] = '\0';
+                    rebuild_view(procs, nprocs); dirty = 1;
                 } else if (key == '\n' || key == '\r') {
-                    filter_edit = 0;
-                    rebuild_view(procs, nprocs);
-                    dirty = 1;
-                } else if (key == 0x7f || key == 0x08) {
-                    if (fl) filter[fl - 1] = '\0';
-                    rebuild_view(procs, nprocs);
-                    dirty = 1;
+                    filter_edit = 0; rebuild_view(procs, nprocs); dirty = 1;
+                } else if ((key == 0x7f || key == 0x08) && fl) {
+                    filter[fl - 1] = '\0';
+                    rebuild_view(procs, nprocs); dirty = 1;
                 } else if ((unsigned char)key >= 32 && (unsigned char)key < 127 &&
                            fl + 1 < sizeof filter) {
-                    filter[fl] = key;
-                    filter[fl + 1] = '\0';
-                    rebuild_view(procs, nprocs);
-                    dirty = 1;
+                    filter[fl] = key; filter[fl + 1] = '\0';
+                    rebuild_view(procs, nprocs); dirty = 1;
                 }
                 continue;
             }
-
-            if (key == 'q' || key == 3)
-                break;
+            if (key == 'q' || key == 3) break;
             if (key == '1') { page = PAGE_DASH; dirty = 1; continue; }
             if (key == '2' || key == 'p') { page = PAGE_PROC; dirty = 1; continue; }
-            if (key == 'c') { sort_mode = SORT_CPU; collect(&s, procs, &nprocs); dirty = 1; continue; }
-            if (key == 'm') { sort_mode = SORT_RSS; collect(&s, procs, &nprocs); dirty = 1; continue; }
+            if (key == 'c') { sort_mode = SORT_CPU; collect(&snap, procs, &nprocs); dirty = 1; continue; }
+            if (key == 'm') { sort_mode = SORT_RSS; collect(&snap, procs, &nprocs); dirty = 1; continue; }
+            if (key == 'n') { sort_mode = SORT_NAME; collect(&snap, procs, &nprocs); dirty = 1; continue; }
             if (key == '/') { page = PAGE_PROC; filter_edit = 1; status_msg[0] = 0; dirty = 1; continue; }
             if (key == 'j') { move_sel(1, procs); dirty = 1; continue; }
             if (key == 'k') { move_sel(-1, procs); dirty = 1; continue; }
+            if (key == 'u') { jump_parent(procs); dirty = 1; continue; }
             if (key == 't') { request_signal(SIGTERM, procs); dirty = 1; continue; }
             if (key == 'K') { request_signal(SIGKILL, procs); dirty = 1; continue; }
             if (key == 'r' || key == ' ') {
                 status_msg[0] = 0;
-                collect(&s, procs, &nprocs);
+                collect(&snap, procs, &nprocs);
                 dirty = 1;
-                continue;
             }
         }
     }
-
     live_leave();
     return 0;
 }
