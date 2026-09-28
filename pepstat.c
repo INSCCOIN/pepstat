@@ -897,15 +897,31 @@ static int proc_match(const Proc *p)
            ci_contains(pidbuf, filter);
 }
 
-static int view_rows(void)
+static void term_size(int *cols, int *rows)
 {
     struct winsize ws;
-    int rows = 24;
-    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_row >= 16)
-        rows = ws.ws_row;
-    rows -= 12;
-    if (rows < 8) rows = 8;
-    if (rows > 40) rows = 40;
+    *cols = 80;
+    *rows = 24;
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0) {
+        if (ws.ws_col > 0)
+            *cols = ws.ws_col;
+        if (ws.ws_row > 0)
+            *rows = ws.ws_row;
+    }
+    if (*cols < 40)
+        *cols = 40;
+    if (*rows < 12)
+        *rows = 12;
+}
+
+static int view_rows(void)
+{
+    int cols, rows, used;
+    term_size(&cols, &rows);
+    used = 5; /* header + box chrome + footer */
+    rows -= used;
+    if (rows < 4)
+        rows = 4;
     return rows;
 }
 
@@ -973,10 +989,25 @@ static void collect(Snap *s, Proc *procs, int *nprocs)
 
 static int term_cols(void)
 {
-    struct winsize ws;
-    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_col >= 60)
-        return ws.ws_col > 120 ? 120 : ws.ws_col;
-    return 80;
+    int cols, rows;
+    term_size(&cols, &rows);
+    return cols;
+}
+
+static int term_rows(void)
+{
+    int cols, rows;
+    term_size(&cols, &rows);
+    return rows;
+}
+
+static int clampi(int v, int lo, int hi)
+{
+    if (v < lo)
+        return lo;
+    if (v > hi)
+        return hi;
+    return v;
 }
 
 static void frame_begin(void) { fputs("\033[H", stdout); }
@@ -1156,16 +1187,23 @@ static void render_dash(const Snap *s, const Proc *procs, int nprocs, int w, int
 {
     char a[32], b[32], title[80];
     double mem_pct = 0, disk_pct = 0, home_pct = 0, swap_pct = 0;
-    int i, show, cores, per_row, barw;
+    int i, show, cores, per_row, barw, spark_w, pct_bar, rows;
+    int show_cores, mem_lines, used, core_lines;
 
+    rows = term_rows();
     render_header(s, w);
+
+    spark_w = w - 22;
+    if (spark_w < 8)
+        spark_w = 8;
+    pct_bar = clampi(w / 12, 6, 24);
 
     snprintf(title, sizeof title, "cpu %.0f%%", s->cpu_pct < 0 ? 0 : s->cpu_pct);
     box_top(w, title);
     box_begin();
-    spark(cpu_hist, cpu_hist_n, w - 18);
+    spark(cpu_hist, cpu_hist_n, spark_w);
     fputs("  ", stdout);
-    bar(s->cpu_pct < 0 ? 0 : s->cpu_pct, 10);
+    bar(s->cpu_pct < 0 ? 0 : s->cpu_pct, pct_bar);
     fg(C_WHITE);
     printf(" %5.1f%%", s->cpu_pct < 0 ? 0 : s->cpu_pct);
     reset_col();
@@ -1183,8 +1221,9 @@ static void render_dash(const Snap *s, const Proc *procs, int nprocs, int w, int
     per_row = (w - 4) / 16;
     if (per_row < 1)
         per_row = 1;
-    if (per_row > 8)
-        per_row = 8;
+    show_cores = rows >= 22;
+    core_lines = show_cores ? (cores + per_row - 1) / per_row : 0;
+    if (show_cores)
     for (i = 0; i < cores; ) {
         int k;
         box_begin();
@@ -1212,7 +1251,7 @@ static void render_dash(const Snap *s, const Proc *procs, int nprocs, int w, int
     snprintf(title, sizeof title, "mem %.0f%%", mem_pct);
     box_top(w, title);
     box_begin();
-    barw = w > 70 ? 28 : 18;
+    barw = clampi(w - 22, 8, w - 16);
     if (s->mem_total_kb) {
         human_bytes((double)(s->mem_total_kb - s->mem_avail_kb) * 1024.0, a, sizeof a);
         human_bytes((double)s->mem_total_kb * 1024.0, b, sizeof b);
@@ -1299,6 +1338,14 @@ static void render_dash(const Snap *s, const Proc *procs, int nprocs, int w, int
     box_end(w);
     box_bot(w);
 
+    mem_lines = 5 + (s->have_home ? 1 : 0);
+    used = 1 + 4 + core_lines + mem_lines + 4 + 3;
+    show = rows - used;
+    if (show < 3)
+        show = 3;
+    if (show > nprocs)
+        show = nprocs;
+
     snprintf(title, sizeof title, "proc  %s", sort_label());
     box_top(w, title);
     box_begin();
@@ -1306,7 +1353,6 @@ static void render_dash(const Snap *s, const Proc *procs, int nprocs, int w, int
     printf("  PID   PPID USER       CPU    MEM  ST  NAME");
     reset_col();
     box_end(w);
-    show = nprocs < 8 ? nprocs : 8;
     for (i = 0; i < show; i++) {
         human_bytes((double)procs[i].rss_kb * 1024.0, a, sizeof a);
         box_begin();
